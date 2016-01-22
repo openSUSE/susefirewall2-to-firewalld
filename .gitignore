@@ -1,0 +1,5 @@
+# Ignore hidden files except gitignore
+.*
+*tar.xz
+!.gitattributes
+!.gitignore

@@ -1,0 +1,32 @@
+#!/bin/sh
+set -e
+
+# Makesure we are in the correct cwd
+NAME=susefirewall2-to-firewalld
+
+if [[ ! $(basename $(pwd)) == ${NAME} ]]; then
+	echo "You should execute this script from the top-level ${NAME} directory"
+	exit 1
+fi
+
+# Clean old
+rm -f *.tar.xz
+
+if ! git describe --tags --abbrev > /dev/null 2>&1; then
+	VERSION=0.git"$(git describe --always --tags --abbrev)"
+else
+	VERSION=$(grep "VERSION=" ${NAME} | tail -n 1 | cut -d '=' -f 2 | tr -d '"')
+fi
+
+if ! git config --get tar.umask > /dev/null 2>&1 ; then
+       git config --add tar.umask 022
+fi
+if ! git config --get tar.tar.xz.command > /dev/null 2>&1; then
+	git config --add tar.tar.xz.command "xz -c"
+fi
+
+pfx=${NAME}-${VERSION}
+pkg=${pfx}.tar.xz
+git archive --worktree-attributes --format=tar.xz -o ${pkg} --prefix="${pfx}"/ HEAD
+
+echo "FILENAME=${pkg}"

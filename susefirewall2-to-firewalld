@@ -1,0 +1,1870 @@
+#!/bin/bash
+#
+# susefirewall2-to-firewalld migration script
+# Copyright (c) 2016 SUSE LINUX Products GmbH
+#
+# Author: Markos Chandras <mchandras@suse.de>
+# Maintainer: Markos Chandras <mchandras@suse.de>
+#
+# Bug reports:
+#  - https://github.com/opensuse/susefirewall2-to-firewalld
+#  - https://bugzilla.opensuse.org
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+#
+# This is a simple bash script aiming to provide a basic migration path from
+# SuSEfirewall2 to FirewallD. However, as SuSEfirewall2 offers a great amount of
+# flexibility, the script may fail or refuse to migrate certain rules. This is on
+# purpose since migrating every possible iptables rule would make the script rather
+# complex and it would also lead to a complicated and unmaintained FirewallD
+# configuration. This script will try to migrate at least the _well-known_ zones
+# and services but it may fail to do anything more sophisticated than that.
+# If you think a critical functionality is missing please open a bug report but you
+# should bear in mind that this script is not an accurate translator between
+# SuSEfirewall2 and firewalld configurations.
+#
+# Since the sole purpose of this script is to provide a starting point for the
+# SuSEfirewall2 to FirewallD migration, it's likely the outcome to not be
+# 100% indentical to what you had with SuSEfirewall2 and some user intervention
+# may be necessary to achieve the desired results.
+#
+
+#
+# Check if this really bash >= 4.0. I know that environmental variables can be
+# overriden but if this is the case then either the environment is already
+# unstable or the user did that on purpose so what can we do?
+#
+[[ ${BASH_VERSINFO[0]} -lt 4 ]] && echo "You need bash >= 4.0" && exit 1
+
+# Do not do anything if we are not root.
+[[ ${UID} != 0 ]] && echo "You need to run ${0} as root" && exit 1
+
+# Check if firewalld is installed
+if ! rpm -qi --quiet firewalld; then
+    echo "firewalld is not installed"
+    exit 1
+fi
+
+#
+# The current version of this script.
+#
+if git describe --always --tags --abbrev > /dev/null 2>&1; then
+    VERSION="git$(git describe --always --tags --abbrev)"
+else
+    VERSION="0.0.1"
+fi
+
+#
+# A few global declarations which are being
+# used throughout this script
+#
+
+# IP version. Intentionally empty. We check for that later on
+IP_VERSION=""
+# Keep a read-only copy of IFS.
+declare -r orIFS=$IFS
+# SuSEfirewall2 to firewalld zone mapping
+declare -r -A zone_mappings=(["ext"]="external" ["dmz"]="dmz" ["int"]="internal")
+# SuSEfirewall2 to firewalld chain mapping. Only those we use
+declare -r -A chain_mappings=(
+    ["input_ext"]="IN_external"
+    ["forward_ext"]="FWDI_external"
+    ["input_dmz"]="IN_dmz"
+    ["forward_dmz"]="FWDI_dmz"
+    ["input_int"]="IN_internal"
+    ["forward_int"]="FWDI_internal"
+)
+# All port forward rules
+declare -A port_forward_to_zone=()
+# Map interfaces to zones
+declare -A interface_to_zone=()
+# Map services to zones
+declare -A service_to_zone=()
+# Map masquerade to zones
+declare -A masquerade_to_zone=()
+# Map packets marked@port@protocol to zone
+declare -A marked_to_port_protocol_zone=()
+# Map icmp to zone
+declare -A icmp_to_zone=()
+# Try to keep this updated
+declare -r -a all_options=('commit' 'debug' 'quiet' 'verbose')
+
+#
+# We assume we don't want a default zone
+# If that's not the case we will fix it later on
+#
+DEFAULT_ZONE=""
+# Log denied packets
+LOG_DENIED=false
+#
+# Rich and direct rules. Unfortunately it may be necessary to use these during
+# migration in order to preserve some functionality. Rich rules are mostly fine
+# but the direct ones should be really avoided since maintaining them is hard.
+#
+declare -A all_rich_rules=()
+declare -a all_direct_rules=()
+
+#
+# Keeps track of the executed firewalld rules during migration.
+# This only makes sense if -d is used
+#
+declare -a all_firewalld_commands=()
+
+help() {
+
+    cat <<EOF
+
+$(basename ${0})-${VERSION}, Copyright (c) 2016 SUSE LINUX Products GmbH
+
+Migration script for SuSEfirewall2 to firewalld.
+
+Options:
+ -c Commit changes. The script will make changes to the system so
+    make sure you only use this option if you are really happy with the proposed
+    changes. This *will* reset your current firewalld configuration so make sure you
+    make backups!
+ -d Super noisy. Use it to file bug reports but be careful to mask sensitive
+    information.
+ -h This message
+ -q No output. Errors will not be printed either!
+ -v Verbose mode. It will print warnings and other informative messages.
+
+Calling ${0} without any option is the safest option
+since it will only output what it will do without committing any changes.
+The only 'invasive' change in your system would be to start/stop/restart
+firewalld and SuSEfirewall2 services which may affect your network connectivity
+and lock yourself out of your system. *DO NOT* run this script on systems you can
+only access via network services (eg ssh). Make sure you backup your iptables
+rules before you proceed.
+
+You should also be aware that if you omit the '-c' option then certain commands
+may look a bit odd to you (or you may spot duplicate commands). That's mostly
+normal because the execution flow depends on certain firewalld commands which
+will not be executed unless you tell the script to do so.
+
+DISCLAIMER:
+
+The end result aims to be closer to what you get from SF2 than from firewalld
+(for example packet flow may be allowed by default between certain zones etc
+which may or may not be something you would expect from firewalld) simply because
+the sole purpose of this script is to get some of the SF2 functionality
+(ie not break firewall setups to a certain extent) whilst running firewalld.
+You are advised to carefully examine the end result and tweak (or completely reconfigure)
+the firewall to suit your needs. This script *is not* a 100% translator between
+SuSEfirewall2 and firewalld configurations and it shouldn't be treated as such.
+
+EOF
+    trap EXIT
+
+    exit 0
+}
+
+#
+# need_bug_report: Simple function to inform user that
+# a bug report is necessary to resolve the issue.
+#
+need_bug_report() {
+    cmdline=${_original_cmdline}
+
+    cat << EOF
+$(bug "#############################################################################")
+$(bug "${cmdline} run into an unexpected problem.")
+$(bug "Please file a bug report providing the following information")
+$(bug "command line: ${cmdline}")
+$(bug "Version: $VERSION")
+$(bug "to https://github.com/hwoarang/susefirewall2-to-firewalld")
+$(bug "or https://bugzilla.opensuse.org")
+$(bug "")
+$(bug "Please also attach the output of the script running in full debug more. It's")
+$(bug "probably easier to redirect all output to a file and attach it along with your")
+$(bug "bug report:")
+$(bug "bash -x ${cmdline} > mycrashlog.txt 2>&1")
+$(bug "#############################################################################")
+
+EOF
+    return 0
+}
+
+#
+# susefirewall2_init: Ensure all required services are in a well known state.
+# We stop firewalld if it is running and we restart SuSEfirewall2 to get rid of
+# transient strange rules which might be lurking around.
+#
+susefirewall2_init() {
+    if [[ ${1} == true ]]; then
+        info "Stopping firewalld"
+        systemctl -q stop firewalld || error "Failed to stop firewalld"
+
+        # Restart it so we start clean
+        info "Restarting SuSEfirewall2_init"
+        systemctl -q restart SuSEfirewall2_init || error "Failed to restart SuSEfirewall2_init"
+
+        info "Restarting SuSEfirewall2"
+        systemctl -q restart SuSEfirewall2 || error "Failed to start SuSEfirewall2"
+    else
+        info "Stopping SuSEfirewall2"
+        systemctl -q stop SuSEfirewall2 || error "Failed to stop the SuSEfirewall2 service"
+
+        info "Stopping SuSEfirewall2_init"
+        systemctl -q stop SuSEfirewall2_init || error "Failed to stop the SuSEfirewall2_init service"
+
+        info "Starting firewalld"
+        systemctl -q restart firewalld || error "Failed to start the firewalld service"
+    fi
+}
+
+#
+# firewalld_reset: Reset firewalld rules to ensure we start in a clean state
+# This will break firewalld runtime configurations but the users already know
+# about that and they shouldn't use a migration script if they already have a
+# working firewalld configuration.
+#
+firewalld_reset() {
+    local chain sanitize icmp interface passthrough pfwd ports rich rule service
+
+    # firewalld's output can contain new lines etc. So just trim it etc.
+    sanitize() {
+        echo $@ | tr -d "\n" | tr -d "\""
+    }
+
+    # Clean up everything
+    for zone in $(firewall-cmd --get-zones); do
+        info "Resetting Zone: \"${zone}\""
+        # Drop masquerade
+        if firewall-cmd -q --zone=${zone} --query-masquerade; then
+            info " -> Removing masquerade"
+            do_fwd_cmd --zone=${zone} --remove-masquerade
+        fi
+        # Drop services
+        for service in $(firewall-cmd --zone=${zone} --list-services); do
+            info " -> Removing service: \"${service}\""
+            do_fwd_cmd --zone=${zone} --remove-service=${service}
+        done
+        # Drop ports
+        for ports in $(firewall-cmd --zone=${zone} --list-ports); do
+            info " -> Removing port(s): \"${ports}\""
+            do_fwd_cmd --zone=${zone} --remove-port="${ports}"
+        done
+        # Drop interfaces
+        for interface in $(firewall-cmd --zone=${zone} --list-interfaces);do
+            info " -> Removing interface: \"${interface}\""
+            do_fwd_cmd --zone=${zone} --remove-interface=${interface}
+        done
+        # Drop ICMP
+        for icmp in $(firewall-cmd --zone=${zone} --list-icmp-blocks); do
+            info " -> Removing icmp: \"${icmp}\""
+            do_fwd_cmd --zone=${zone} --remove-icmp-block="${icmp}"
+        done
+        # Drop port forwarding
+        for pfwd in $(firewall-cmd --zone=${zone} --list-forward-ports); do
+            info " -> Removing port forward \"${pfwd}\""
+            do_fwd_cmd --zone=${zone} --remove-forward-port="${pfwd}"
+        done
+        #
+        # Drop rich rules because they may conflict with the SuSEfirewall2 rules
+        # Handle output line by line.
+        #
+        IFS=$'\n' && \
+        for rich in $(firewall-cmd --zone=${zone} --list-rich-rules); do
+            IFS=$orIFS && set -- $(sanitize ${rich})
+            info " -> Removing rich rule: \"${rich}\"" && \
+            # Rich rule as single argument
+            do_fwd_cmd --zone=${zone} --remove-rich-rule="$*" && \
+            IFS=$'\n'
+        done && IFS=$orIFS
+    done
+
+    # Drop direct chains
+    IFS=$'\n' && \
+    for chain in $(firewall-cmd --direct --get-all-chains); do
+        info "Removing direct chain and its rules: \"${chain}\""
+        IFS=$orIFS && set -- ${chain}
+        do_fwd_cmd --direct --remove-rules $@
+        do_fwd_cmd --direct --remove-chain $@
+        IFS=$'\n'
+    done && IFS=$orIFS
+
+    # Drop direct rules
+    IFS=$'\n' && \
+    for rule in $(firewall-cmd --direct --get-all-rules); do
+        info "Removing direct rule: \"${rule}\""
+        IFS=$orIFS && set -- ${rule}
+        do_fwd_cmd --direct --remove-rule $@
+        IFS=$'\n'
+    done && IFS=$orIFS
+
+    # Drop passthrough rules
+    IFS=$'\n' && \
+    for passthrough in $(firewall-cmd --direct --get-all-passthroughs); do
+        info "Removing passthrough rule: \"${passthrough}\""
+        IFS=$orIFS && set -- ${passthrough}
+        do_fwd_cmd --direct --remove-passthrough $@
+        IFS=$'\n'
+    done && IFS=$orIFS
+
+    # All done right?
+    info ""
+    info "FirewallD has been reset!"
+    info ""
+
+    return 0
+}
+
+#
+# firewalld_default_zone: Set default zone
+#
+firewalld_default_zone() {
+    local current_default_zone default_zone
+
+    [[ -z ${DEFAULT_ZONE} ]] && return 0
+
+    current_default_zone=$(firewall-cmd --get-default-zone)
+    default_zone=${zone_mappings[${DEFAULT_ZONE}]}
+
+    # This should never happen
+    if [[ -z ${current_default_zone} ]]; then
+        need_bug_report
+        error "firewall-cmd --get-default-zone returned nothing!"
+    fi
+
+    if [[ ${default_zone} != ${current_default_zone} ]]; then
+        info "Setting default zone to \"${default_zone}\""
+        do_fwd_cmd --set-default-zone=${default_zone}
+    fi
+}
+
+#
+# firewalld_interfaces: Add interfaces to firewalld zones
+#
+firewalld_interfaces() {
+    local interface zone
+
+    for zone in ${!zone_mappings[@]}; do
+        for interface in ${interface_to_zone[$zone]}; do
+            # only add it if it is not there. But why would it?
+            if firewall-cmd -q --zone=${zone_mappings[$zone]} --query-interface=${interface}; then
+                continue
+            fi
+            info "Adding interface=\"${interface}\" to zone=\"${zone_mappings[$zone]}\""
+            do_fwd_cmd --zone=${zone_mappings[$zone]} --add-interface=${interface}
+        done
+    done
+
+    return 0
+}
+
+#
+# firewalld_services: Add services to zone. If service does not exist we don't add a direct rule. We
+# instead warn the user and probe him to file an upstream bug about that
+# service or create an xml file himself.
+#
+firewalld_services() {
+    local found protocol ports service zone
+
+    #
+    # firewalld directories to look for zones, services etc.
+    # FIXME: we may also want to use rpm information to retrieve these
+    # directories since spec files might change and install things into
+    # different places.
+    #
+    declare -r -a FIREWALLD_INSTALL_DIRS=("/usr/lib/firewalld" "/etc/firewalld")
+
+    for zone in ${!zone_mappings[@]}; do
+        for service in ${service_to_zone[$zone]}; do
+            protocol=${service%%_*}
+            ports=${service##*_}
+            found=false
+            for service_dir in ${FIREWALLD_INSTALL_DIRS[@]}; do
+                [[ ! -d ${service_dir} ]] && continue
+                #
+                # We assume that only one service uses the said
+                # ports. If not, then something else needs to be done
+                # here (but what?). I am fairly sure this ugly thing can be
+                # simplified a little bit but XML parsing in bash
+                # is not pretty anyway.
+                #
+                service=$(grep -E "<port.* protocol=\"?${protocol}\"?" \
+                    ${service_dir}/services/* 2>/dev/null | \
+                    grep -E "<port.* port=\"?${ports}\"?[^0-9]" | \
+                    cut -d ":" -f 1 | rev | cut -d "/" -f 1 | rev | \
+                    sed "s/\.xml//" | head -n 1)
+                [[ -n ${service} ]] && found=true && break
+            done
+            if [[ ${found} == true ]]; then
+                if firewall-cmd -q --zone=${zone_mappings[$zone]} --query-service=${service}; then
+                    continue
+                fi
+                info "Enabling service=\"${service}\" to zone=\"${zone_mappings[${zone}]}\""
+                do_fwd_cmd --zone=${zone_mappings[${zone}]} --add-service=${service}
+            fi
+
+            if [[ ${found} == false ]]; then
+                if firewall-cmd -q --zone=${zone_mappings[${zone}]} --query-port="${ports}/${protocol}"; then
+                    continue
+                fi
+                warn ""
+                warn "There is no firewalld service with protocol=$protocol and ports=${ports}"
+                warn "Consider creating one yourself and place it in /etc/firewalld/services/"
+                warn "or file a bug upstream if this is a well-known service."
+                warn ""
+
+                info "Adding port(s)=\"${ports}/${protocol}\" to zone=\"${zone_mappings[${zone}]}\""
+                do_fwd_cmd --zone=${zone_mappings[${zone}]} --add-port="${ports}/${protocol}"
+            fi
+        done
+    done
+}
+
+#
+# firewalld_masquerade: Do masquerade
+#
+firewalld_masquerade() {
+    local zone
+
+    for zone in ${!zone_mappings[@]}; do
+        if [[ ${masquerade_to_zone[${zone}]} == true ]]; then
+            if firewall-cmd -q --zone=${zone_mappings[${zone}]} --query-masquerade; then
+                continue
+            fi
+            info "Enabling 'masquerade' to zone=\"${zone_mappings[${zone}]}\""
+            do_fwd_cmd --zone=${zone_mappings[${zone}]} --add-masquerade
+        fi
+    done
+}
+
+#
+# firewalld_rich: Do rich rules
+#
+firewalld_rich() {
+    local rule zone
+
+    # Rich
+    for zone in ${!all_rich_rules[@]}; do
+        IFS=$'\n'
+        for rule in ${all_rich_rules[$zone]}; do
+            # break it down
+            IFS=$orIFS
+            if firewall-cmd -q --zone=${zone_mappings[${zone}]} --query-rich-rule="$(remove_newlines ${rule})"; then
+                continue
+            fi
+            IFS=$orIFS
+            info "Enabling rich rule=\"${rule}\" for zone=\"${zone_mappings[${zone}]}\""
+            do_fwd_cmd --zone=${zone_mappings[${zone}]} --add-rich-rule="$(remove_newlines ${rule})"
+            IFS=$'\n'
+        done
+        IFS=$orIFS
+    done
+}
+
+#
+# firewalld_direct: Do direct rules
+#
+firewalld_direct() {
+    local rule
+
+    # Direct.
+    IFS=$'\n'
+    for rule in ${all_direct_rules[@]}; do
+        # break it down
+        IFS=$orIFS
+        set -- ${rule}
+        if firewall-cmd -q --direct --query-passthrough $(remove_newlines ${@}); then
+            continue
+        fi
+        IFS=$orIFS
+        info "Enabling direct rule=$(remove_newlines ${@})"
+        do_fwd_cmd --direct --add-passthrough $(remove_newlines ${@})
+        IFS=$'\n'
+    done
+    IFS=$orIFS
+}
+
+#
+# firewalld_port_forwarding: Do port forwarding
+#
+firewalld_port_forwarding() {
+    local pfwd zone
+
+    for zone in ${!zone_mappings[@]}; do
+        for pfwd in ${port_forward_to_zone[${zone}]}; do
+            if firewall-cmd -q --zone=${zone_mappings[${zone}]} --query-forward-port="${pfwd}"; then
+                continue
+            fi
+            info "Enabling port forward=\"${pfwd}\" to zone=\"${zone_mappings[${zone}]}\""
+            do_fwd_cmd --zone=${zone_mappings[${zone}]} --add-forward-port="${pfwd}"
+        done
+    done
+}
+
+#
+# firewalld_logging: Set loggigng for denied packets. firewalld logging is a bit
+# special and it will reload the firewall so we need to run this at the very end
+# of our process once all are migration rules are in place
+#
+firewalld_logging() {
+    if [[ ${LOG_DENIED} == true ]]; then
+        # Is this feature supported?
+        if ! firewall-cmd -q --get-log-denied; then
+            warn "Logging is not supported in this version of firewalld"
+            return
+        fi
+        if [[ "$(firewall-cmd --get-log-denied)" != "all" ]]; then
+            info "Enable logging for denied packets"
+            do_fwd_cmd --set-log-denied=all
+        fi
+    fi
+}
+
+#
+# firewalld_ipsec: Allow IPSec if needed by the zone
+#
+firewalld_ipsec() {
+    local zone
+
+    # set default (from SF2) is not set
+    FW_IPSEC_TRUST=${FW_IPSEC_TRUST:-no}
+
+    # No IPSec trust, then nothing to do.
+    [[ ${FW_IPSEC_TRUST} == no ]] && return 0
+    # SF2 treats 'yes' the same as 'int'
+    [[ ${FW_IPSEC_TRUST,,} == yes ]] && FW_IPSEC_TRUST="int"
+
+    zone=${zone_mappings[${FW_IPSEC_TRUST}]}
+
+    case ${FW_IPSEC_TRUST} in
+        dmz|ext|int)
+            if firewall-cmd -q --zone=${zone} --query-service=ipsec; then
+            return 0
+            fi
+            info "Allowing IPSec traffic in zone=\"${zone}\""
+            do_fwd_cmd --zone=${zone} --add-service=ipsec
+            ;;
+        * ) warn "Unsupported FW_IPSEC_TRUST=${FW_IPSEC_TRUST} value"
+            return 1
+            ;;
+    esac
+}
+
+#
+# firewalld_icmp: Do ICMP. SuSEfirewall2 blocks everything by default and allows certain icmp
+# types but firewalld does the opposite so we ought to be a bit messy here.
+#
+firewalld_icmp() {
+    local allowed icmp_type known_icmp zone
+    declare -a processed_types=()
+
+    for zone in ${!zone_mappings[@]}; do
+        # We only handle the ones firewalld knows about
+        for known_icmp in $(firewall-cmd --get-icmptypes); do
+            allowed=false
+            # This contains the ones we want to allow
+            for icmp_type in ${icmp_to_zone[${zone}]}; do
+                # But we only allow it if firewalld knows it
+                [[ "${known_icmp}" == "${icmp_type}" ]] && allowed=true && break
+            done
+
+            if [[ ${allowed} == false ]]; then
+                # Only add it if it not there already
+                if ! firewall-cmd -q --zone=${zone_mappings[${zone}]} --query-icmp-block=${known_icmp}; then
+                    info "Blocking icmp=\"${known_icmp}\" for zone=\"${zone_mappings[${zone}]}\""
+                    do_fwd_cmd --zone=${zone_mappings[${zone}]} --add-icmp-block="${known_icmp}"
+                fi
+            fi
+            # Mark the one we blocked as BLOCKED
+            icmp_to_zone[${zone}]=${icmp_to_zone[${zone}]/${known_icmp}/PROCESSED}
+        done
+    done
+
+    #
+    # And now let the user know which ICMP rules couldn't be processed
+    # because firewalld has no idea about them
+    #
+    for zone in ${!zone_mappings[@]}; do
+        for icmp_type in ${icmp_to_zone[${zone}]}; do
+            if [[ "${icmp_type}" != "PROCESSED" ]]; then
+                for p in ${processed_types[@]}; do
+                    [[ "${p}" == "${icmp_type}" ]] && break 2
+                done
+                processed_types+=("${icmp_type} ")
+
+                warn ""
+                warn "icmp type=\"${icmp_type}\" is unknown to firewalld"
+                warn "so an iptable rule couldn't be created for it. Either"
+                warn "create this icmptype yourself (see firewalld.icmptype(5))"
+                warn "or open a bug upstream."
+                warn ""
+            fi
+        done
+    done
+}
+
+#
+# recover_after_fail: Simply restart SuSEfirewall2 if something went south
+#
+recover_after_fail() {
+    warn ""
+    warn "Restoring original SuSEfirewall2 rules due to script failure."
+    warn ""
+    susefirewall2_init true
+}
+
+#
+# reset_vars: Reset options to default state
+#
+reset_opts() {
+    local opt
+
+    for opt in ${all_options[@]}; do
+        eval "${opt}=false"
+    done
+}
+
+# Simple helpers for user visible messages
+ubug() { ${quiet} || echo "UPSTREAM BUG[#$1]: ${@:2}"; }
+bug() { ${quiet} || echo "BUG: $@"; }
+
+debug() { ${debug} && echo "DEBUG: $@"; }
+
+error() { ${quiet} || { echo "ERROR: $@" 1>&2 && exit 1; }; }
+
+info() { ${quiet} || echo "INFO: $@"; }
+dinfo() { info "DIRECT: Adding direct rule=\"${@}\""; }
+rinfo() { info "RICH: Adding rich rule=\"${1}\" to zone=\"${2}\""; }
+pinfo() { info "Port(s) \"${1}(${2^^})\" will be added to the \"${zone_mappings[$3]}\" zone"; }
+
+iinfo() {
+    local icmp_code=$1 icmp_name zone=$2
+    # Just get the first one if we have multiple names
+    icmp_name=$(echo ${icmp_num_to_name[${icmp_code}]} | cut -d " " -f 1)
+    info "ICMP: Adding icmp type=\"${icmp_code}[${icmp_name}]\" to zone=\"${zone}\""
+}
+
+warn() { ${quiet} || { ${verbose} && echo "WARNING: $@"; }; }
+mwarn() { warn "MIGRATION: ${1} will not be migrated to FirewallD"; }
+dwarn () { warn "MIGRATION: Rule ${@} can't be migrated. Please consider using a direct rule instead"; }
+
+#
+# remove_newlines: Simple function to remove new lines
+#
+remove_newlines() {
+    echo "${@}" | tr -d '\n'
+}
+
+#
+# fwd_die: Simple function to handle firewalld-cmd command errors
+# $@: The firewall-cmd command
+#
+fwd_die() {
+    echo "FIREWALLD ERROR: Command 'firewall-cmd $@' failed"
+    need_bug_report
+    exit 1
+}
+
+#
+# read_susefirewall2_config: Read the configuration file and try to find out
+# what can't be migrated
+#
+read_susefirewall2_config() {
+    local nomigrate rule z
+
+    nomigrate() {
+        z=${!1}
+        [[ -z ${z} ]] && return 1
+        mwarn "${1}=${z}"
+    }
+
+    #
+    # The SuSEfirewall configurations and scripts
+    #
+    declare -r SUSEFIREWALL2_CONFIG="/etc/sysconfig/SuSEfirewall2"
+    declare -r SUSEFIREWALL2_SCRIPTS="/etc/sysconfig/scripts"
+
+    #
+    # Things we know we can't migrate for sure. FIXME: it's probably
+    # not exhaustive.
+    #
+    declare -r -a SUSEFIREWALL2_NO_MIGRATE=(
+    FW_PROTECT_FROM_INT
+        FW_LO_NOTRACK
+        FW_FORWARD_ALWAYS_INOUT_DEV
+        FW_ZONES
+        FW_ZONE_DEFAULT
+        FW_IPv6_REJECT_OUTGOING
+        FW_HTB_TUNE_DEV
+        FW_CUSTOMRULES
+        FW_ALLOW_CLASS_ROUTING
+    )
+
+    info "Reading the ${SUSEFIREWALL2_CONFIG} file"
+    source ${SUSEFIREWALL2_CONFIG}
+
+    #
+    # There are certain things which simply generate iptables we can't really
+    # parse so better break now than later on.
+    #
+    for rule in ${SUSEFIREWALL2_NO_MIGRATE[@]}; do
+        z=${!rule}
+        debug "Checking SF2 option \"${rule}\" with value=\"${z}\""
+        case ${rule} in
+            FW_PROTECT_FROM_INT)
+                # We don't support the 'notrack' option
+                case ${z,,} in
+                    notrack) nomigrate $rule ;;
+                    yes|no) break ;;
+                    *) warn "Unsupported FW_PROTECT_FROM_INT=${z,,} value" ;;
+                esac
+                ;;
+            FW_LO_NOTRACK)
+                # Only complain if empty or yet is set
+                [[ ${z,,} == "no" ]] && continue
+                z=${z:-yes}
+                nomigrate $rule ;;
+            FW_FORWARD_ALWAYS_INOUT_DEV) nomigrate $rule ;;
+            FW_ZONES)
+                nomigrate $rule || continue
+                warn "Only 'ext', 'dmz' and 'int' zones are supported for migration."
+                error "Please remove your custom zones and restart the script."
+                ;;
+            FW_ZONE_DEFAULT)
+                # Only 'ext', 'dmz', 'int', 'no' and 'auto' are supported
+                case ${z,,} in
+                    ext|dmz|int|no|auto) ;;
+                    *) nomigrate $z $rule ;;
+                esac
+                ;;
+            FW_HTB_TUNE_DEV)
+                nomigrate $rule || continue
+                warn "Consider using the ${SUSEFIREWALL2_SCRIPTS}/SuSEfirewall2-qdisc directly"
+                ;;
+            FW_CUSTOMRULES)
+                nomigrate $rule || continue
+                error "Custom rules may break the migration and they are generally not supported"
+                ;;
+            FW_ALLOW_CLASS_ROUTING)
+                # forwarding is allowed between interfaces in the same zone in
+                # FirewallD so this can be migrated.
+                [[ ${z,,} == "yes" ]] && continue
+                z=${z:-no}
+                nomigrate $rule
+                ;;
+        esac
+    done
+}
+
+#
+# detect_tools: Detect necessary tools before we attempt to do anything useful in our script
+#
+detect_tools() {
+    local tool
+
+    declare -r -a needed_tools=('diff' 'firewall-cmd' 'iptables' 'ip6tables' 'SuSEfirewall2' 'systemctl')
+
+    for tool in ${needed_tools[@]}; do
+        if ! which ${tool} > /dev/null 2>&1; then
+            error "\"${tool}\" is not installed. Support of ${tool} will be disabled!"
+        fi
+        # Is it executable?
+        if [[ ! -x $(which ${tool}) ]]; then
+            error "${tool} can't be executed. That should never happen!"
+        fi
+        # Check we can actually use iptables -w
+        if [[ ${tool} == ip*tables ]] && ! ${tool} -w -L > /dev/null 2>&1; then
+            error "${tool} -w is not usable. ${tool} >= 1.4.20 is needed"
+        fi
+    done
+
+    return 0
+}
+
+#
+# add_interface_to_zone: Add interface to zone
+# $1: zone
+# $2: interface
+#
+add_interface_to_zone() {
+    local ifname=$2 zone=$1 z
+
+    for z in ${interface_to_zone[${zone}]}; do
+        [[ ${z} == ${ifname} ]] && return 1
+    done
+    interface_to_zone[${zone}]+="${ifname} "
+
+    return 0
+}
+
+#
+# add_icmp_to_zone: Add ICMP code to zone
+# $1: zone
+# ${@:2}: iptables rule ICMP framgment
+#
+add_icmp_to_zone() {
+    local builder found=false icmp_code icmp_name icmp_num_to_name icmp_sub_name
+    local k param rule=${@:2} zone=$1
+
+    #
+    # Static icmp mapping table. FIXME: See if there is a way
+    # to improve that and/or get this programmatically.
+    # v4: https://tools.ietf.org/html/rfc792
+    # v6: https://tools.ietf.org/html/rfc4443
+    #
+    declare -r -A ipv4_icmp_num_to_name=(
+        [0]="echo-reply pong"
+        [3]="destination-unreachable"
+         [3/0]="network-unreachable"
+         [3/1]="host-unreachable"
+         [3/2]="protocol-unreachable"
+         [3/3]="port-unreachable"
+         [3/4]="fragmentation-needed"
+         [3/5]="source-route-failed"
+         [3/6]="network-unknown"
+         [3/7]="host-unknown"
+         [3/9]="network-prohibited"
+         [3/10]="host-prohibited"
+         [3/11]="TOS-network-unreachable"
+         [3/12]="TOS-host-unreachable"
+         [3/13]="communication-prohibited"
+         [3/14]="host-precedence-violation"
+         [3/15]="precedence-cutoff"
+        [4]="source-quench"
+        [5]="redirect"
+         [5/0]="network-redirect"
+         [5/1]="host-redirect"
+         [5/2]="TOS-network-redirect"
+         [5/3]="TOS-host-redirect"
+        [6]="alternative-host-address"
+        [8]="echo-request ping"
+        [9]="router-advertisement"
+        [10]="router-solicitation"
+        [11]="time-exceeded ttl-exceeded"
+         [11/0]="ttl-zero-during-transit"
+         [11/1]="ttl-zero-during-reassembly"
+        [12]="parameter-problem"
+         [12/0]="ip-header-bad"
+         [12/1]="required-option-missing"
+        [13]="timestamp-request"
+        [14]="timestamp-reply"
+        [15]="information-request"
+        [16]="information-reply"
+        [17]="address-mask-request"
+        [18]="address-mask-reply"
+    )
+
+    declare -r -A ipv6_icmp_num_to_name=(
+        [1]="destination-unreachable"
+         [1/0]="no-route"
+         [1/1]="communication-prohibited"
+         [1/2]="address-unreachable"
+         [1/3]="port-unreachable"
+        [2]="packet-too-big"
+        [3]="time-exceeded ttl-exceeded"
+         [3/0]="ttl-zero-during-transit"
+         [3/1]="ttl-zero-during-reassembly"
+        [4]="parameter-problem"
+         [4/0]="bad-header"
+         [4/1]="unknown-header-type"
+         [4/2]="unknown-option"
+        [128]="echo-request ping"
+        [129]="echo-reply pong"
+        [130]="multicast-listener-query"
+        [131]="multicast-listener-report"
+        [132]="multicast-listener-done"
+        [133]="router-solicitation"
+        [134]="router-advertisement"
+        [135]="neighbour-solicitation neighbor-solicitation"
+        [136]="neighbour-advertisement neighbor-advertisement"
+        [137]="redirect"
+    )
+
+    #
+    # FIXME: Can we make this a bit cleaner? And no, iteration
+    # isn't an option ;)
+    #
+    builder=$(declare -p ${IP_VERSION}_icmp_num_to_name)
+    eval "declare -A icmp_num_to_name="${builder#*=}
+
+    set -- ${rule}
+
+    for param in ${rule}; do
+        shift
+        #
+        # We know it's an icmp rule so we only care about --icmp-type or
+        # icmpv6-type
+        #
+        [[ "${param}" == *icmp*-type* ]] && found=true && break
+    done
+
+    [[ ${found} == false ]] && return 1
+
+    icmp_code="${1}"
+
+    for icmp_type in ${icmp_to_zone[${zone}]}; do
+        # some icmp types use multiple names
+        icmp_sub_name="${icmp_num_to_name[${icmp_code}]}"
+        for k in ${icmp_sub_name}; do
+            [[ ${icmp_type} == ${k} ]] && return 1
+        done
+    done
+
+    # Just get the first one if we have multiple names.
+    icmp_name=${icmp_num_to_name[${icmp_code}]%% *}
+    icmp_to_zone[${zone}]+="${icmp_name} "
+    iinfo "${icmp_code}" "${zone}"
+
+    return 0
+}
+
+#
+# add_service_to_zone: Add interface to zone
+# $1: zone
+# $2: protocol
+# $3: ports
+#
+add_service_to_zone() {
+    local ports=$3 proto=$2 z zone=$1 z
+
+    for z in ${service_to_zone[${zone}]}; do
+        [[ ${z} == ${proto}_${ports} ]] && return 1
+    done
+    service_to_zone[${zone}]+="${proto}_${ports} "
+
+    return 0
+}
+
+#
+# do_input_forward: Analyze an INPUT or FORWARD rule
+#
+do_input_forward() {
+    local ret
+
+    #
+    # Any rule in the form of:
+    # -A <chain or zone> ...
+    #
+    # So it could be anything really. First we look for interface-to-zone
+    # assignments, default policies etc and then for adding services to zones.
+    # It can't be both.
+    #
+    do_interface_to_zone_mapping $@
+    ret=$?
+    case $ret in
+        0|2) return $ret ;; # 0: all good 2: Unhandled rule but not service related
+        1) do_service_to_zone_mapping $@; return ;;
+        *) debug "Unsupported return value from do_interface_to_zone_mapping" ;;
+    esac
+}
+
+#
+# do_interface_to_zone_mapping: Analyze an iptable rule and extract zone and
+# interface information
+# $@: iptables rule interface fragment
+#
+do_interface_to_zone_mapping() {
+    local chain=$1 interface rule=${@:2} target zone
+
+    set -- ${rule}
+
+    #
+    # This aims to handle the following rules
+    #
+    # -i/-o <IF> -j <TARGET>
+    # -j <TARGET>
+    #
+    # The following one seems strange but it helps with delays in
+    # local bridges.
+    # -m physdev --physdev-is-bridged -j <target>
+    #
+
+    while true; do
+        case $1 in
+            -i|-o) interface=${2}; shift 2 ;; # -i/-o <IF> -j <TARGET>
+            -j)
+                target=${2}
+                #
+                # Found the target for interface or zone. Get out
+                #
+                [[ -n "${interface}" ]] && break
+
+                #
+                # This either sets the default zone or the default policy
+                # for our zones
+                #
+                case ${chain} in
+                    # This sets default policy for our zones
+                    input_*|forward_*|output_*)
+                        #
+                        # FirewallD rejects by default so we will ignore
+                        # DROP/REJECT and only respect the ACCEPT policy
+                        # FIXME: Should we also respect DROP?
+                        #
+                        [[ ${target} != ACCEPT ]] && return 0
+
+                        # Map SF2 chain to firewalld
+                        chain=${chain_mappings[${chain}]}
+                        rule="${IP_VERSION} -t filter -A ${chain} ${rule}"
+
+                        # It has to be a direct rule
+                        all_direct_rules+=("${rule}"$'\n')
+                        dinfo "${rule}"
+                        return 0
+                        ;;
+                esac
+                #
+                # We are here becase we most likely got something like
+                # -A INPUT -j <zone> which effectively sets the default zone
+                # to <zone>.
+                #
+                # First of all, we may use the FW_ZONE_DEFAULT if it's usable
+                #
+                if [[ -n ${FW_ZONE_DEFAULT} ]]; then
+                    case ${FW_ZONE_DEFAULT} in
+                        ext|dmz|int) DEFAULT_ZONE=${FW_ZONE_DEFAULT} && return 0 ;;
+                    esac
+                fi
+
+                #
+                # We don't normally expect multiple rules for the
+                # default zone. -A INPUT -j <target> implies that
+                # <target> is going to be our last resort so whatever
+                # follows is never going to be seen by the firewall right?
+                #
+                [[ -n "${DEFAULT_ZONE}" || "${target}" == "DROP" ]] && return 0
+
+                DEFAULT_ZONE="${target#*_}"
+
+                return 0
+                ;;
+            -m) # -m physdev --physdev-is-bridged -j <target>
+                target=${2}
+                if [[ "${target}" == "physdev" ]]; then
+                    #
+                    # Allow bridged traffic between ports. This must be
+                    # the first rule in the forwarding chain otherwise we
+                    # are risking blocking it or wasting resources
+                    #
+                    info "Allowing bridged traffic (physdev extension)"
+                    all_direct_rules+=("${IP_VERSION} -t filter -A ${chain} ${rule}"$'\n')
+
+                    return 0
+
+                elif [[ "${target}" == "conntrack" ]]; then
+                    # This could be a service.
+                    return 1
+                else
+                    mwarn "-A ${chain} ${rule}"
+
+                    return 2
+                fi
+
+                ;;
+            *) break ;;
+        esac
+    done
+
+    # Ignore loopback. firewalld does that for us
+    [[ "$interface" == "lo" ]] && return 0
+
+    #
+    # Target assumes to be in format of -A <chain> ... -j <zone>
+    # similar to what SuSEfirewall2 deploys
+    #
+    case ${target} in
+        input_*|forward_*|output_*)
+            zone=${target##*_}
+            ;;
+        *)
+        #
+        # As you may have seen from above, we usually break from the
+        # case statement when we haven't found -i, -o or -j in an
+        # _expected_ way. For example -j ACCEPT would match but
+        # -m tcp -p tcp -j ACCEPT wouldn't because we deliberately
+        # ignore such options. Return 1 so we can treat that rule as
+        # a port forwarding one upon return.
+        #
+        return 1
+        ;;
+    esac
+
+    # Handle zone
+    case $zone in
+        ext|dmz|int)
+            [[ -z ${interface} ]] && \
+            need_bug_report && error "interface can't be empty!"
+            add_interface_to_zone $zone $interface && \
+                info "Interface \"${interface}\" will be added to the \"${zone_mappings[${zone}]}\" zone"
+            return 0
+            ;;
+
+        *) info "Rule=$vrule can't be migrated. Consider using a direct rule in firewalld instead";;
+    esac
+
+    return 1
+}
+
+#
+# do_prerouting: Analyze a prerouting rule and generate something sensible
+# for firewalld.
+# $@: iptables rule fragment
+#
+do_prerouting() {
+    local built_rule dst_net found interface internal_host internal_ports marked mpacket
+    local protocol _protocol _port ports rich=false rule=${@} src_net target zone zones
+    set -- ${rule}
+
+    #
+    # We assume the user knows what he is doing and has correct masquerade
+    # settings in the SuSEfirewall2 configuration file. Either way, our
+    # generated rule(s) can't be any worse right?
+    # Here are example rules to understand what we actually try to parse here:
+    #
+    # -A PREROUTING -s 192.168.99.0/24 -d 192.168.100.0/24 -p tcp -m tcp --dport 11:22 -j REDIRECT --to-ports 333
+    # -A PREROUTING -s 192.168.100.0/24 -d 192.168.101.90/32 -i tun+ -p tcp -m tcp --dport 33:44 -j DNAT --to-destination 192.168.101.1:55-66
+    # -A PREROUTING -s 192.168.123.0/24 -p tcp -m tcp --dport 80 -j MARK --set-xmark 0x1/0xffffffff
+    # which is really important to consider since it restricts the source networks. It's usually present with REDIRECT rules.
+    #
+
+    # First we need to understand our rule
+    while true; do
+        case ${1} in
+            -d) dst_net=${2}; rich=true; shift 2 ;;
+            -j)
+                if [[ "${2^^}" != "DNAT" && "${2^^}" != "REDIRECT" && "${2^^}" != "MARK" ]]; then
+                    debug "Unhandled -j ${2} option in \"${rule}\""
+                    return 1
+                fi
+                target="${2,,}"
+                shift 2
+                ;;
+            -m) shift 2 ;;
+            -i) interface=${2}; shift 2 ;;
+            -p) protocol=${2}; shift 2 ;;
+            -s) src_net="${2}"; rich=true; shift 2 ;;
+            # We ignore the mask. Maybe FIXME?
+            --set-xmark) marked=${2%%/*}; shift 2 ;;
+            # iptables uses ':' for ranges but firewalld uses '-'
+            --dport) ports=${2/:/-}; shift 2 ;;
+            # --to-destination <ip>:<port>
+            --to-destination) internal_host=${2%%:*}; internal_ports=${2##*:}; shift 2 ;;
+            --to-ports) internal_ports=${2}; shift 2 ;;
+            '') break ;;
+            *) return 1 ;;
+        esac
+    done
+
+    [[ -z ${protocol} ]] && need_bug_report && error "protocol can't be empty@"
+    #
+    # DNAT rules seem to always contain an interface. See
+    # forward_masquerading_rules() in SF2
+    #
+    [[ -z ${interface} && ${target} == "dnat" ]] && need_bug_report && error "interface can't be empty!"
+
+    #
+    # Redirect in SF2 works this way:
+    # Mangle table: Mark the packet with the source port
+    # NAT table   : Do the redirect
+    # Filter table: Accept the redirected/marked packet.
+    #
+    # The flow is this:
+    # (mangle)<ext IP:port> -> (nat)<FW IP:new port> -> (filter)FW IP:ACCEPT
+    #
+    # We will do the same because firewalld can't do natively REDIRECT targets.
+    #
+    # A more 'open' approach would be to ignore the marking of the packet, do
+    # the redirect and then open the new_port to the firewall itself. However,
+    # this would open the port to everybody and not just to those targetting
+    # the original source port which may not be what we want. We have the code
+    # in place to do the 'more' open approach if needed.
+    # This preserves the SF2 functionality. This is tracked in [gh#78]
+    #
+    if [[ ${target} == mark ]]; then
+        marked="${marked}@${ports}@${protocol}"
+        # simply add it to the array.
+        marked_to_port_protocol_zone[${marked}]=""
+        debug "Adding marked packet \"${marked}\" for later processing"
+        # Reconstruct the direct rule.
+        rule="${IP_VERSION} -t mangle -A PREROUTING ${rule}"
+        ubug 78 "Adding direct rule=\"${rule}\" to preserve the REDIRECT functionality"
+        all_direct_rules+=("${rule}"$'\n')
+
+        return 0
+    elif [[ ${target} == redirect ]]; then
+        #
+        # OK so this is a redirect rule. We need to check if there is a
+        # matching marked packet in our 'database'.
+        #
+        for mpacket in ${!marked_to_port_protocol_zone[@]}; do
+            IFS="@" && set -- ${mpacket} && IFS=$orIFS
+            # Format: $marked@$port@$protocol
+             marked=${1}
+            _port=${2}
+            _protocol=${3}
+            if [[ ${protocol} == ${_protocol} && ${ports} == ${_port} ]]; then
+                for zone in ${marked_to_port_protocol_zone[${mpacket}]}; do
+                    zones+="${zone} "
+                done
+            fi
+        done
+
+        [[ -z ${zone} ]] && error "REDIRECT rule \"${rule}\" does not have a matching MARK rule"
+
+        #
+        # redirect rules means that the packet is for the firewall itself.
+        # We should use a direct rule because a rich forward-port can't
+        # handle the REDIRECT target well. See [gh#78]. We only need to
+        # accept the packet for the redirects. So we use a direct 'mark rule'
+        # instead. Uncomment the following 3 lines implement the more 'open'
+        # approach of opening the ports for everybody in the zone.
+        #
+        #for zone in ${zones}; do
+        #    add_service_to_zone ${zone} ${protocol} ${internal_ports}
+        #    [[ $? == 0 ]] && pinfo ${internal_ports} ${protocol} ${zone}
+        #done
+        #
+        # https://github.com/t-woerner/firewalld/issues/78
+        #
+
+        # The packet is only accepted for certain zones.
+        for zone in ${zones}; do
+            # Build the mark rule
+            built_rule="${IP_VERSION} -t filter "
+            built_rule+="-A ${chain_mappings[input_${zone}]} -m conntrack "
+            built_rule+="--ctstate NEW,RELATED,ESTABLISHED -m mark "
+            built_rule+="--mark ${marked} -j ACCEPT"
+            ubug 78 "Adding direct rule=\"${built_rule}\" to preserve the REDIRECT functionality"
+            all_direct_rules+=("${built_rule}"$'\n')
+        done
+
+        # And now inject the NAT rule
+        built_rule="${IP_VERSION} -t nat -A PREROUTING ${rule}"
+        ubug 78 "Adding direct rule=\"${built_rule}\" to preserve the REDIRECT functionality"
+        all_direct_rules+=("${built_rule}"$'\n')
+
+        return 0
+    fi
+
+    # From now on everything is related to DNAT
+
+    #
+    # DNAT: First we need to find out if the interface is known to us. If it is
+    # not something is wrong and we bail out.
+    #
+    for zone in ${!zone_mappings[@]}; do
+        for i in ${interface_to_zone[${zone}]}; do
+            [[ ${i} == ${interface} ]] && found=${zone} && break 2
+        done
+    done
+    [[ -z ${found} ]] && \
+    need_bug_report && error "Interface \"${interface}\" wasn't found in any zone!"
+
+    [[ -z ${internal_host} || -z ${internal_ports} ]] && \
+    need_bug_report && error "Rule \"${rule}\" contains an invalid --to-destination option"
+
+    # Rich rule because we either have -s or -d or both in the iptables rule
+    if [[ ${rich} == true ]]; then
+        built_rule="rule family=${IP_VERSION} "
+        [[ -n ${src_net} ]] && built_rule+="source address=${src_net} "
+        [[ -n ${dst_net} ]] && built_rule+="destination address=${dst_net} "
+        built_rule+="forward-port port=${ports} protocol=${protocol} to-port=${internal_ports} "
+        built_rule+="to-addr=${internal_host}"
+
+        rinfo "${built_rule}" "${zone}"
+        all_rich_rules[${zone}]+="${built_rule}"$'\n'
+
+        return 0
+    fi
+
+    # A straightforward port-forward rule
+    built_rule="port=${ports}:proto=${protocol}"
+    [[ -n ${internal_ports} ]] && built_rule+=":toport=${internal_ports}"
+    [[ -n ${internal_host} ]] && built_rule+=":toaddr=${internal_host}"
+
+    port_forward_to_zone[${zone}]+="${built_rule} "
+
+    info "Adding port forward rule with:"
+    info "* port(s)=\"${ports}\" protocol=\"${protocol:-ALL}\" interface=\"${interface:-ALL}\""
+    info "* to internal host=\"${internal_host}\" on port(s)=\"${internal_ports}\" on zone=\"${zone}\""
+
+    return 0
+}
+
+#
+# do_postrouting: Analyze an iptable POSTROUTING rule and either generated the
+# appropriate firewalld equivalent (masquerade, etc)
+# $@: iptables rule masquerade fragment
+#
+do_postrouting() {
+    local direct=false direct_rule dst_net i in_interface in_zone
+    local out_interface protocol rule=$@ src_net target z
+    set -- ${rule}
+
+    #
+    # This aims to handle the following rules
+    # -o <interface> -j MASQUERADE
+    # -s <net> -o <interface> -j MASQUERADE
+    #
+    # Remember: The following rules do not need to be handled here
+    # -s <net> [-d <net>] -o <interface> [-p <protocol> -m <protocol>] [--dport <port:port>] -j ACCEPT
+    # -s <net> [-d <net>] -o <interface> [-p <protocol> -m <protocol>] [--dport <port:port>] -j MASQUERADE
+    # because they should really be created by firewalld when it opens the said
+    # port
+    while true; do
+        case $1 in
+            -d) dst_net=${2}; shift 2 ;;
+            -o) out_interface=${2}; shift 2 ;;
+            -i) in_interface=${2}; shift 2 ;;
+            -s) src_net=${2}; shift 2 ;;
+            -j)
+                if [[ "${2}" != "MASQUERADE" && "${2}" != "ACCEPT" ]]; then
+                    debug "Unhandled -j ${2} option in ${rule}"
+                    return 1
+                fi
+                target="${2,,}"
+                shift 2
+                ;;
+            -m|-p) protocol=${2}; shift 2 ;;
+            --dport)
+                #
+                # This is probably port forwarding no? We deal with that
+                # in prerouting
+                #
+                return 1
+                ;;
+            '') break ;;
+            *) return 1 ;;
+        esac
+    done
+
+    #
+    # Direct rule only if we both in and out interfaces.
+    # FIXME: Is this more complex than necessary?
+    #
+    if [[ -n ${out_interface} && -n ${in_interface} ]]; then
+        direct_rule="${IP_VERSION} -t nat -A POSTROUTING ${rule}"
+        all_direct_rules+=("${direct_rule}"$'\n')
+        info "Direct rule=\"${direct_rule}\" will be used to preserve the MASQUERADE functionality"
+        # And need a matching FORWARD accept rule only if we really do
+        # masquerade
+        [[ ${target} == "accept" ]] && return 1
+        direct_rule="${IP_VERSION} -t filter -A FORWARD ${rule/MASQUERADE/ACCEPT}"
+        all_direct_rules+=("${direct_rule}"$'\n')
+        info "Direct rule=\"${direct_rule}\" will be used to preserve the MASQUERADE functionality"
+        return
+    fi
+
+    # Iterate over the zones and find the one for our in and out interfaces
+    [[ -n ${in_interface} ]] && \
+    for z in ${!interface_to_zone[@]}; do
+        for i in ${interface_to_zone[${z}]}; do
+            [[ ${i} == ${in_interface} ]] && in_zone=${z} && break 2
+        done
+    done
+
+    [[ -n ${out_interface} ]] && \
+    for z in ${!interface_to_zone[@]}; do
+        for i in ${interface_to_zone[${z}]}; do
+            [[ ${i} == ${out_interface} ]] && out_zone=${z} && break 2
+        done
+    done
+
+
+    if [[ -z ${in_zone} && -n ${in_interface} ]]; then
+        # This is simply a rule we can't handle sorry.
+        debug "Interface(IN) ${in_interface} does not belong to any zone! Skipping..."
+        debug "Unhandled iptables rule: ${rule}"
+        return 1
+    fi
+    if [[ -z ${out_zone} && -n ${out_interface} ]]; then
+        debug "Interface(OUT) ${out_interface} does not belong to any zone! Skipping..."
+        debug "Unhandled iptables rule: ${rule}"
+        return 1
+    fi
+
+    # Somewhat less complicated since it's only source and destination involved
+    if [[ -n ${src_net} || -n ${dst_net} ]]; then
+        #
+        # We need to know our target. ACCEPT means we don't do masquerade so we
+        # simply accept the packet. This needs a direct rule of course. For
+        # example:
+        # -A POSTROUTING -s 192.168.111.0/24 -o eth0 -j ACCEPT
+        # -A POSTROUTING -o eth0 -j ACCEPT
+        # This will prevent 192.168.111.0/24 from MASQUERADE whilst allowing
+        # everything else
+        #
+        if [[ ${target} == "accept" ]]; then
+            rule="${IP_VERSION} -t nat -A POSTROUTING ${rule}"
+            all_direct_rules+=("${rule}"$'\n')
+            dinfo "${rule}"
+            return
+        fi
+
+        rich_rule="rule family=${IP_VERSION} "
+        [[ -n ${src_net} ]] && rich_rule+="source address=${src_net} "
+        [[ -n "${dst_net}" ]] && rich_rule+="destination address=${dst_net} "
+        [[ -n "${protocol}" ]] && rich_rule+="protocol value=${protocol} "
+        rich_rule+="${target} "
+
+        all_rich_rules["${out_zone}"]+="${rich_rule}"$'\n'
+        info "Rich rule \"${rich_rule}\" will be enabled for zone=\"${zone}\""
+        # https://github.com/t-woerner/firewalld/issues/80
+        rich_rule="${IP_VERSION} -t filter -A FORWARD "
+        [[ -n ${src_net} ]] && rich_rule+="-s ${src_net} "
+        [[ -n ${dst_net} ]] && rich_rule+="-d ${src_net} "
+        rich_rule+="-j ACCEPT"
+        ubug 80 "Adding matching direct rule=\"${rich_rule}\" to complement the MASQUERADE functionality"
+        all_direct_rules+=("${rich_rule}"$'\n')
+        return
+    fi
+
+    if [[ ${masquerade_to_zone["${out_zone}"]} != true ]]; then
+        masquerade_to_zone["${out_zone}"]=true
+        info "Masquerade will be enabled for the \"${out_zone}\" zone"
+    fi
+
+    return 0
+}
+
+#
+# do_service_to_zone_mapping: Analyze an iptable rule and extract zone and
+# interface information
+# $@: iptables rule service fragment
+#
+do_service_to_zone_mapping() {
+    local chain dst_net icmp_code marked mpacket ports proto rich=false rich_rule rule=$@
+    local service src_net target zone
+    set -- ${rule}
+
+    #
+    # This aims to handle the following rules
+    # -p <proto> -m <proto> --dport <port range> -j <target>
+    # -p icmp -m icmp --icmp-type <type> -j <target>
+    # -p icmp -m conntrack --ctstate RELATED,ESTABLISHED -m icmp --icmp-type <type> -j <target>
+    # -s <net> [-d <net>] -m conntrack --ctstate [NEW],RELATED,ESTABLISED, -j ACCEPT
+    # -m conntrack --ctstate NEW,RELATED,ESTABLISHED -m mark --mark 0x1 -j ACCEPT
+    #
+    # Anything else is out of scope. We probably don't care
+    # about the target since everything is disabled by default
+    # so all services/ports found there must be allowed services right?
+    # Moreover the do_interface_to_zone_mapping sets the default policy for our
+    # zone so that should be good enough.
+    #
+    # Rich rules:
+    # We generate a rich rule when:
+    # - we have a source address
+    # - we have a destination address
+
+    # $1 can be a well-known chain (eg INPUT) or an SF2 one (eg input_ext)
+    chain=${1%%_*}
+    zone=${1##*_}
+
+    while true; do
+        case $1 in
+            -s) src_net=${2}; rich=true; shift 2 ;;
+            -d) dst_net=${2}; rich=true; shift 2 ;;
+            -p) proto=${2}; shift 2 ;;
+            -i|-o)
+                # Sounds like this is something we need to add to our direct rules
+                set -- ${rule}
+                all_direct_rules+=("${IP_VERSION} -t filter -A ${chain_mappings[$1]} ${*:2}"$'\n')
+                dinfo "${rule}"
+                return 0
+                ;;
+            --dport) ports=${2}; shift 2 ;;
+            -m) shift 2 ;;
+            --mark) marked=${2%%/*}; shift 2 ;;
+            -j) target=${2}; break ;;
+            *) shift ;; # This shouldn't lead to infinite loop since we should find a -j target in the end
+        esac
+    done
+
+    # For protocol + port with src/dst nets we need a rich rule
+    if [[ ${rich} == true ]]; then
+        rich_rule="rule family=${IP_VERSION} "
+        [[ -n ${src_net} ]] && rich_rule+="source address=${src_net} "
+        [[ -n ${dst_net} ]] && rich_rule+="destination address=${dst_net} "
+        if [[ -z ${ports} ]]; then
+            rich_rule+="protocol value=${proto} accept"
+        else
+            rich_rule+="port port=${ports} protocol=${proto} accept"
+        fi
+        all_rich_rules[${zone}]+="${rich_rule}"$'\n'
+        rinfo "${rich_rule}" "${zone}"
+        return 0
+    fi
+
+    #
+    # If marked packet we need to find a matching rich rule and drop it from
+    # the zone it does not belong to.
+    #
+    if [[ -n ${marked} ]]; then
+        # loop through all the marked packets
+        for mpacket in ${!marked_to_port_protocol_zone[@]}; do
+            IFS="@" && set -- ${mpacket} && IFS=$orIFS
+            _marked=$1 _port=$2 _protocol=$3
+            if [[ ${marked} == ${_marked} ]]; then
+                info "Adding marked packet=\"${mpacket}\" to zone=\"${zone}\""
+                # Found it
+                marked_to_port_protocol_zone[$mpacket]+="${zone} "
+                return 0
+            fi
+        done
+        need_bug_report
+        error "Rule \"${rule}\" uses an unknown marked packet!"
+    fi
+
+    # No protocol == no service I am affraid. Something else we don't normally handle
+    [[ -z ${proto} ]] && { debug "Unhandled rule: ${rule}";  return 1; }
+
+    # Not a well known target so nothing we could do either
+    [[ ${target} != ACCEPT ]] && [[ ${target} != DROP ]] && \
+    [[ ${target} != REJECT ]] && return 1
+
+    #
+    # If chain is one of the well-known ones eg INPUT, FORWARD etc
+    # then inject a direct rule and return. This normally handles the
+    # following rule in ip6tables in an out-of-the-box SF2 installation:
+    #
+    # -A INPUT -p udp -m udp --dport 546 -j ACCEPT
+    #
+    case $proto in
+        tcp|udp) 
+            if [[ ${chain} == "INPUT" || ${chain} == "FORWARD" ]]; then
+                set -- ${rule}
+                rule="${IP_VERSION} -t filter -A ${chain^^} ${*:2}"
+                all_direct_rules+=("${rule}"$'\n')
+                dinfo ${rule}
+            elif [[ ${zone} == "ext" || ${zone} == "int" || ${zone} == "dmz" ]]; then
+                add_service_to_zone ${zone} ${proto} ${ports/:/-}
+                [[ $? == 0 ]] && pinfo ${ports} ${proto} ${zone}
+            fi
+            ;;
+        icmp|ipv6-icmp)
+            add_icmp_to_zone ${zone} ${rule}
+            # Also allow it to the internal zones
+            case ${zone} in
+                ext|dmz) add_icmp_to_zone "int" ${rule} ;;
+            esac
+            ;;
+    esac
+}
+
+#
+# add_interfaces_to_default_zone: Add interfaces not explicitely added to an
+# iptables chain to the default zone just like SuSEfirewall2 does.
+#
+add_interfaces_to_default_zone() {
+    local found interface x z zone
+    set -- /sys/class/net/*
+
+    # This corresponds to FW_ZONE_DEFAULT="no"
+    [[ -z ${DEFAULT_ZONE} ]] && return
+
+    for z in ${@}; do
+        found=false
+        interface="${z#/sys/class/net/}"
+        [[ "${interface}" == "lo" ]] && continue
+        # Only add interfaces to the default zone if they don't belong to another zone
+        for zone in ${!interface_to_zone[@]}; do
+            for x in ${interface_to_zone[${zone}]}; do
+                [[ "${interface}" == "${x}" ]] && found=true && break 2
+            done
+        done
+        if [[ ${found} == false ]]; then
+            info "Interface \"${interface}\" will be added to the \"${DEFAULT_ZONE}\" zone"
+            interface_to_zone[${DEFAULT_ZONE}]+="${interface} "
+        fi
+    done
+}
+
+#
+# do_iptables_new_rule: Analyze and convert and iptables rule to something
+# firewalld can understand. As you can probably imagine this is the real stuff.
+#
+# $1: chain
+# ${@:2}
+#
+do_iptables_new_rule() {
+    local chain=$1 unhandled vrule=${@:2}
+
+    unhandled() {
+        mwarn "-A ${chain} ${vrule}"
+    }
+
+    case $chain in
+        INPUT|FORWARD) ;& # fall through
+        input_*|forward_*) do_input_forward $chain $vrule || unhandled ;;
+        POSTROUTING) do_postrouting $vrule || unhandled ;;
+        PREROUTING) do_prerouting $vrule || unhandled ;;
+        *) debug "Unhandled $chain in iptables rule" ;;
+    esac
+}
+
+#
+# do_fwd_cmd: Execute a firewall-cmd command
+# $@: The firewall-cmd command
+#
+do_fwd_cmd() {
+    debug "Executing: firewall-cmd $*"
+    # We need to see firewall-cmd errors so we can debug the script
+    $commit && { all_firewalld_commands+=("$*"$'\n') && firewall-cmd "$@" 1>/dev/null || fwd_die; }
+}
+
+#
+# dump_info: Dump information prior to converting them to firewalld rules
+#
+dump_info() {
+    local rule zone
+    ${debug} || return
+
+    debug "####################### COLLECTED SF2 INFORMATION ###############################"
+    [[ -n ${DEFAULT_ZONE} ]] && debug "DEFAULT_ZONE=\"${zone_mappings[${DEFAULT_ZONE}]}\""
+    [[ -n ${FW_IPSEC_TRUST} ]] && debug "IPSEC_TRUST=\"${FW_IPSEC_TRUST,,}\""
+    debug "LOG DENIED PACKETS=\"${LOG_DENIED^^}\""
+
+    for zone in ${!interface_to_zone[@]}; do
+        debug "ZONE=\"${zone}\" INTERFACES=\"${interface_to_zone[${zone}]}\""
+    done
+    for zone in ${!service_to_zone[@]}; do
+        debug "ZONE=\"${zone}\" SERVICE=\"${service_to_zone[${zone}]}\""
+    done
+    for zone in ${!masquerade_to_zone[@]}; do
+        debug "ZONE=\"${zone}\" MASQUERADE=\"${masquerade_to_zone[${zone}]}\""
+    done
+    IFS=$'\n'
+    for rule in ${all_direct_rules[@]}; do
+        debug "DIRECT=\"${rule}\""
+    done
+    IFS=$orIFS
+    for zone in ${!all_rich_rules[@]}; do
+        IFS=$'\n'
+        for rule in ${all_rich_rules[${zone}]}; do
+            debug "ZONE=\"${zone}\" RICH=\"${rule}\""
+        done
+        IFS=$orIFS
+    done
+    IFS=$orIFS
+    for zone in ${!icmp_to_zone[@]}; do
+        debug "ZONE=\"${zone}\" ICMP=\"${icmp_to_zone[${zone}]}\""
+    done
+    for zone in ${!port_forward_to_zone[@]}; do
+        debug "ZONE=\"${zone}\" PORT_FORWARD=\"${port_forward_to_zone[${zone}]}\""
+    done
+    debug "#################################################################################"
+}
+
+#
+# dump_all_firewalld_commands: Print all the firewalld commands we executed
+#
+dump_all_firewalld_commands() {
+    ${debug} || return
+
+    IFS=$'\n'
+    debug ""
+    debug "############# The following FirewallD commands has been executed ################"
+    for cmd in ${all_firewalld_commands[@]}; do
+        debug "firewall-cmd" ${cmd}
+    done
+    debug "#################################################################################"
+    debug ""
+    IFS=$orIFS
+}
+
+#
+# post_commit_report: Executed before terminating the script. Useful to put
+# cleanup code and user-visible information
+#
+post_commit_report() {
+    ${quiet} && return
+
+    if ! ${commit}; then
+        info "##################################################################################"
+        info ""
+        info "The dry-run has been completed. Please check the above output to ensure"
+        info "that everything looks good."
+        info ""
+        info "##################################################################################"
+        # Restart SF2
+        susefirewall2_init true
+
+        return 0
+    fi
+    info "##################################################################################"
+    info ""
+    info "Your SuSEfirewall2 rules have been migrated to FirewallD. A celebration is in order!"
+    info ""
+    info "Please note that the firewalld rules haven't been made permanent yet."
+    info "Use 'firewall-cmd --list-all-zones' to verify you are happy with the proposed"
+    info "configuration and then use 'firewall-cmd --runtime-to-permanent' to make it permanent."
+    info "However, you are advised to look at the following resources and/or"
+    info "commands before making permanent changes to your firewall:"
+    info ""
+    info "- http://www.firewalld.org/documentation/"
+    info "- firewall-cmd --help"
+    info "- firewall-cmd --list-all-zones"
+    info "- firewall-cmd --direct --get-all-passthrough"
+    info "- And the firewalld manpages of course!"
+    info ""
+    info "##################################################################################"
+}
+
+###################################### MAIN #############################################
+
+reset_opts # probably not necessary
+
+_original_cmdline="${0} $@"
+
+while getopts "cdhqv" opt; do
+    case $opt in
+        c) commit=true ;;
+        d) debug=true ;;
+        q) quiet=true ;;
+    v) verbose=true ;;
+        h|?|:) help ;;
+    esac
+done
+
+if [[ $quiet == true && ($debug == true || $verbose == true) ]]; then
+    error "-q can't be used with -d or -v"
+fi
+
+# Detect necessary tools
+detect_tools
+
+# Read the SuSEfirewall2 configuration and decide what to migrate
+read_susefirewall2_config
+
+_counter=5
+info "Ensuring all firewall services are in a well-known state."
+info "This will start/stop/restart firewall services and it's likely"
+info "to cause network disruption."
+info "If you do not wish for this to happen, please stop the script now!"
+
+${quiet} || \
+while [[ ${_counter} -gt 0 ]]; do
+    echo -n "${_counter}..."
+    sleep 1
+    let _counter=_counter-1
+    # Fix output
+    [[ ${_counter} == 0 ]] && echo "Lets do it!"
+done
+
+# Before we start we need to make sure that SuSEfirewall is running
+susefirewall2_init true
+
+# Reset everything if we mess up
+trap recover_after_fail EXIT
+
+# We are now ready to do some iptables magic. 
+while read rule; do
+    set -- ${rule}
+    action=$1; shift
+    chain=$1
+    vrule=$@
+
+    debug "iptables rule: ${rule}"
+
+    if echo "${rule}" | grep -q -- '-j LOG'; then
+        # Only log denied rules
+        if echo "${rule}" | grep -q -- 'DROP-DEFLT'; then
+            LOG_DENIED=true
+        else
+            mwarn "${rule}"
+        fi
+        continue
+    fi
+    #
+    # SuSEfirewall2 does not normally generate rules with inverted components
+    # so skip it for now. However this may exist in custom rules... The grep
+    # is probably not great but it will do for now. Furthermore inverted rules
+    # will probably need rich or direct rules which is something we don't
+    # normally do.
+    #
+    echo "${rule}" | grep -q -- '!'  && \
+    { debug "Inverted rules are being ignored!"; continue; }
+
+    case $action in
+        -P) ;; # Skip policy rules. firewalld will do that for us
+        -N) ;; # firewalld will create its own chains
+        -A) do_iptables_new_rule $vrule ;;
+        IP_VERSION*) eval ${action} && debug "Setting IP_VERSION to \"${IP_VERSION}\"" ;;
+        *) debug "Unhandled iptables action=${action} chain=${chain} rule=${vrule}" ;;
+    esac
+
+    # Make sure IP_VERSION is not empty
+    [[ -z ${IP_VERSION} ]] && need_bug_report && error "IP_VERSION is not set!"
+done < \
+<( \
+  echo "IP_VERSION=ipv4"; iptables -w -t mangle -S; iptables -w -S; iptables -w -t nat -S; \
+  echo "IP_VERSION=ipv6"; ip6tables -w -t mangle -S; ip6tables -w -S; ip6tables -w -t nat -S \
+)
+
+add_interfaces_to_default_zone
+
+# Dump information
+dump_info
+
+# Lets stop SuSEfirewall2 services and start firewalld
+susefirewall2_init false
+
+#
+# Seems like it take a few seconds for everything to be loaded. We need a better
+# way to figure out if everything is deployed before we start messing with it.
+# What we can do in order to detect if all the tables are loaded is to run
+# iptables -S twice and compare the output. Needless to say I am not proud of
+# this solution.
+#
+while true; do
+    #
+    # There is no provision to avoid infinite loops here but well... we all
+    # know this should never happen right? :-)
+    #
+    diff <(iptables -S -w) <(iptables -S -w) > /dev/null 2>&1
+    if [[ $? != 0 ]]; then
+        sleep 3
+    else
+        break
+    fi
+done
+
+firewalld_reset
+
+firewalld_default_zone
+
+firewalld_interfaces
+
+firewalld_services
+
+firewalld_masquerade
+
+firewalld_rich
+
+firewalld_port_forwarding
+
+firewalld_icmp
+
+firewalld_ipsec
+
+# This really must be the last part of our rules
+firewalld_direct
+
+firewalld_logging
+
+dump_all_firewalld_commands
+
+post_commit_report
+
+# Phew! All done right?
+trap EXIT
+
+exit 0

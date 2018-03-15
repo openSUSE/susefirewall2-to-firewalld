@@ -1617,7 +1617,8 @@ do_iptables_new_rule() {
 do_fwd_cmd() {
     debug "Executing: firewall-cmd $*"
     # We need to see firewall-cmd errors so we can debug the script
-    $commit && { all_firewalld_commands+=("$*"$'\n') && firewall-cmd "$@" 1>/dev/null || fwd_die; }
+    all_firewalld_commands+=("$*"$'\n')
+    $commit && { firewall-cmd "$@" 1>/dev/null || fwd_die; }
 }
 
 #

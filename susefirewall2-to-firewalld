@@ -93,6 +93,8 @@ declare -A port_forward_to_zone=()
 declare -A interface_to_zone=()
 # Map services to zones
 declare -A service_to_zone=()
+# Map known services to zones
+declare -A known_service_to_zone=()
 # Map masquerade to zones
 declare -A masquerade_to_zone=()
 # Map packets marked@port@protocol to zone
@@ -199,11 +201,20 @@ EOF
 }
 
 #
+# susefirewall2_present: Check the status of the SuSEfirewall2 package.
+#
+susefirewall2_present() {
+	rpm --quiet -qi SuSEfirewall2
+}
+
+#
 # susefirewall2_init: Ensure all required services are in a well known state.
 # We stop firewalld if it is running and we restart SuSEfirewall2 to get rid of
 # transient strange rules which might be lurking around.
 #
 susefirewall2_init() {
+    susefirewall2_present || return 0
+
     if [[ ${1} == true ]]; then
         info "Stopping firewalld"
         systemctl -q stop firewalld || error "Failed to stop firewalld"
@@ -437,6 +448,10 @@ firewalld_services() {
                 info "Adding port(s)=\"${ports}/${protocol}\" to zone=\"${zone_mappings[${zone}]}\""
                 do_fwd_cmd --zone=${zone_mappings[${zone}]} --add-port="${ports}/${protocol}"
             fi
+        done
+        for service in ${known_service_to_zone[$zone]}; do
+            info "Enabling service=\"${service}\" to zone=\"${zone_mappings[${zone}]}\""
+            do_fwd_cmd --zone=${zone_mappings[${zone}]} --add-service="${service}"
         done
     done
 }
@@ -703,6 +718,7 @@ read_susefirewall2_config() {
     # The SuSEfirewall configurations and scripts
     #
     declare -r SUSEFIREWALL2_CONFIG="/etc/sysconfig/SuSEfirewall2"
+    declare -r SUSEFIREWALL2_CONFIG_RPMSAVE="/etc/sysconfig/SuSEfirewall2.rpmsave"
     declare -r SUSEFIREWALL2_SCRIPTS="/etc/sysconfig/scripts"
 
     #
@@ -721,8 +737,16 @@ read_susefirewall2_config() {
         FW_ALLOW_CLASS_ROUTING
     )
 
-    info "Reading the ${SUSEFIREWALL2_CONFIG} file"
-    source ${SUSEFIREWALL2_CONFIG}
+    if [[ -e ${SUSEFIREWALL2_CONFIG} ]]; then
+        info "Reading the ${SUSEFIREWALL2_CONFIG} file"
+        source ${SUSEFIREWALL2_CONFIG}
+    elif [[ -e ${SUSEFIREWALL2_CONFIG_RPMSAVE} ]]; then
+        info "Reading the ${SUSEFIREWALL2_CONFIG_RPMSAVE} file"
+        source ${SUSEFIREWALL2_CONFIG_RPMSAVE}
+    else
+        info "No SuSEfirewall2 configuration was found."
+        exit 1
+    fi
 
     #
     # There are certain things which simply generate iptables we can't really
@@ -783,7 +807,7 @@ read_susefirewall2_config() {
 detect_tools() {
     local tool
 
-    declare -r -a needed_tools=('diff' 'firewall-cmd' 'iptables' 'ip6tables' 'SuSEfirewall2' 'systemctl')
+    declare -r -a needed_tools=('diff' 'firewall-cmd' 'iptables' 'ip6tables' 'systemctl')
 
     for tool in ${needed_tools[@]}; do
         if ! which ${tool} > /dev/null 2>&1; then
@@ -940,13 +964,29 @@ add_icmp_to_zone() {
 }
 
 #
-# add_service_to_zone: Add interface to zone
+# add_known_service_to_zone: Add known service to zone
+#
+# $1: zone
+# $2: service
+#
+add_known_service_to_zone() {
+    local service=$2 z zone=$1
+
+    for z in ${known_service_to_zone[${zone}]}; do
+        [[ ${z} == ${service} ]] && return 1
+    done
+    known_service_to_zone[${zone}]+="${service} "
+
+    return 0
+}
+
+# add_service_to_zone: Add service to zone
 # $1: zone
 # $2: protocol
 # $3: ports
 #
 add_service_to_zone() {
-    local ports=$3 proto=$2 z zone=$1 z
+    local ports=$3 proto=$2 z zone=$1
 
     for z in ${service_to_zone[${zone}]}; do
         [[ ${z} == ${proto}_${ports} ]] && return 1
@@ -1652,6 +1692,9 @@ dump_info() {
     for zone in ${!service_to_zone[@]}; do
         debug "ZONE=\"${zone}\" SERVICE=\"${service_to_zone[${zone}]}\""
     done
+    for zone in ${!known_service_to_zone[@]}; do
+        debug "ZONE=\"${zone}\" SERVICE=\"${known_service_to_zone[${zone}]}\""
+    done
     for zone in ${!masquerade_to_zone[@]}; do
         debug "ZONE=\"${zone}\" MASQUERADE=\"${masquerade_to_zone[${zone}]}\""
     done
@@ -1675,6 +1718,82 @@ dump_info() {
         debug "ZONE=\"${zone}\" PORT_FORWARD=\"${port_forward_to_zone[${zone}]}\""
     done
     debug "#################################################################################"
+}
+
+susefirewall2_absent_migration() {
+    declare -r SUSEFIREWALL2_CONFIG_RPMSAVE="/etc/sysconfig/SuSEfirewall2.rpmsave"
+    local fw_zones=(EXT INT DMZ) cz z i rich_rule
+    local fw_services=(TCP UDP IP RPC) cs p s
+    local rich=(ACCEPT REJECT) r
+
+    info "SuSEfirewall2 is not installed. Will attempt to migrate only based on the old configuration file"
+
+    source ${SUSEFIREWALL2_CONFIG_RPMSAVE}
+
+    info "Adding interfaces to zones"
+    for z in ${fw_zones[@]}; do
+        cz=FW_DEV_${z}
+        for i in ${!cz}; do
+            add_interface_to_zone "${z,,}" $i
+        done
+    done
+
+    info "Adding services to zones"
+    for z in ${fw_zones[@]}; do
+        for p in ${fw_services[@]}; do
+            cs=FW_SERVICES_${z}_${p}
+            for s in ${!cs}; do
+                if [[ ${s} =~ [a-z] ]]; then
+                    add_known_service_to_zone "${z,,}" ${s}
+                else
+                    add_service_to_zone "${z,,}" "${p,,}" ${s/:/-}
+                fi
+            done
+        done
+    done
+
+    info "Adding generic services to zones"
+    for z in ${fw_zones[@]}; do
+        for r in ${rich[@]}; do
+            cs=FW_SERVICES_${r}_${z}
+            for s in ${!cs}; do
+                IFS=',' && set -- $s && IFS=$orIFS
+                rich_rule="rule family=ipv4 source address=${1} "
+                # We can't have both protocol and port in the roles
+                if [[ ! -n ${3} ]]; then
+                    rich_rule+="protocol value=${2} "
+                else
+                    rich_rule+="port port=${3/:/-} protocol=${2} "
+                fi
+                rich_rule+=${r,,}
+                all_rich_rules[${z,,}]+="${rich_rule}"$'\n'
+                rinfo "${rich_rule}" "${z,,}"
+            done
+        done
+    done
+
+    info "Adding masquerade to zones"
+    if [[ ${FW_MASQUERADE:-''} == 'yes' ]]; then
+        for i in ${FW_MASQ_DEV}; do
+            if [[ ${i} =~ zone: ]]; then
+                debug "Enabling 'masquerade' on '${i#*:}' interface"
+                masquerade_to_zone[${i#*:}]=true
+            else
+              # We need to find the zone for the specific interface
+               debug "Enabling 'masquerade' to zone of the '${i}' interface" && \
+                for z in ${!interface_to_zone[@]}; do
+                    [[ "${interface_to_zone[$z]}" =~ ${i} ]] && \
+                        masquerade_to_zone[${z}]=true
+                done
+            fi
+        done
+    fi
+
+    info "Adding logging of dropped packages"
+    if [[ ${FW_LOG_DROP_CRIT:-''} == 'yes' ]] || \
+        [[ ${FW_LOG_DROP_ALL} == 'yes' ]]; then
+       LOG_DENIED=true
+    fi
 }
 
 #
@@ -1779,49 +1898,54 @@ susefirewall2_init true
 # Reset everything if we mess up
 trap recover_after_fail EXIT
 
-# We are now ready to do some iptables magic. 
-while read rule; do
-    set -- ${rule}
-    action=$1; shift
-    chain=$1
-    vrule=$@
+if ! susefirewall2_present; then
+    susefirewall2_absent_migration
+else
 
-    debug "iptables rule: ${rule}"
+    # We are now ready to do some iptables magic.
+    while read rule; do
+        set -- ${rule}
+        action=$1; shift
+        chain=$1
+        vrule=$@
 
-    if echo "${rule}" | grep -q -- '-j LOG'; then
-        # Only log denied rules
-        if echo "${rule}" | grep -q -- 'DROP-DEFLT'; then
-            LOG_DENIED=true
-        else
-            mwarn "${rule}"
+        debug "iptables rule: ${rule}"
+
+        if echo "${rule}" | grep -q -- '-j LOG'; then
+            # Only log denied rules
+            if echo "${rule}" | grep -q -- 'DROP-DEFLT'; then
+                LOG_DENIED=true
+            else
+                mwarn "${rule}"
+            fi
+            continue
         fi
-        continue
-    fi
-    #
-    # SuSEfirewall2 does not normally generate rules with inverted components
-    # so skip it for now. However this may exist in custom rules... The grep
-    # is probably not great but it will do for now. Furthermore inverted rules
-    # will probably need rich or direct rules which is something we don't
-    # normally do.
-    #
-    echo "${rule}" | grep -q -- '!'  && \
-    { debug "Inverted rules are being ignored!"; continue; }
+      #
+        # SuSEfirewall2 does not normally generate rules with inverted components
+        # so skip it for now. However this may exist in custom rules... The grep
+        # is probably not great but it will do for now. Furthermore inverted rules
+        # will probably need rich or direct rules which is something we don't
+        # normally do.
+        #
+        echo "${rule}" | grep -q -- '!'  && \
+        { debug "Inverted rules are being ignored!"; continue; }
 
-    case $action in
-        -P) ;; # Skip policy rules. firewalld will do that for us
-        -N) ;; # firewalld will create its own chains
-        -A) do_iptables_new_rule $vrule ;;
-        IP_VERSION*) eval ${action} && debug "Setting IP_VERSION to \"${IP_VERSION}\"" ;;
-        *) debug "Unhandled iptables action=${action} chain=${chain} rule=${vrule}" ;;
-    esac
+        case $action in
+            -P) ;; # Skip policy rules. firewalld will do that for us
+            -N) ;; # firewalld will create its own chains
+            -A) do_iptables_new_rule $vrule ;;
+            IP_VERSION*) eval ${action} && debug "Setting IP_VERSION to \"${IP_VERSION}\"" ;;
+            *) debug "Unhandled iptables action=${action} chain=${chain} rule=${vrule}" ;;
+        esac
 
-    # Make sure IP_VERSION is not empty
-    [[ -z ${IP_VERSION} ]] && need_bug_report && error "IP_VERSION is not set!"
-done < \
-<( \
-  echo "IP_VERSION=ipv4"; iptables -w -t mangle -S; iptables -w -S; iptables -w -t nat -S; \
-  echo "IP_VERSION=ipv6"; ip6tables -w -t mangle -S; ip6tables -w -S; ip6tables -w -t nat -S \
-)
+        # Make sure IP_VERSION is not empty
+        [[ -z ${IP_VERSION} ]] && need_bug_report && error "IP_VERSION is not set!"
+    done < \
+    <( \
+      echo "IP_VERSION=ipv4"; iptables -w -t mangle -S; iptables -w -S; iptables -w -t nat -S; \
+      echo "IP_VERSION=ipv6"; ip6tables -w -t mangle -S; ip6tables -w -S; ip6tables -w -t nat -S \
+    )
+fi
 
 add_interfaces_to_default_zone
 
@@ -1885,3 +2009,4 @@ trap EXIT
 susefirewall2_init switch
 
 exit 0
+# vim: set ts=4 sw=4 expandtab:

@@ -214,7 +214,7 @@ susefirewall2_init() {
 
         info "Restarting SuSEfirewall2"
         systemctl -q restart SuSEfirewall2 || error "Failed to start SuSEfirewall2"
-    else
+    elif [[ ${1} == false ]]; then
         info "Stopping SuSEfirewall2"
         systemctl -q stop SuSEfirewall2 || error "Failed to stop the SuSEfirewall2 service"
 
@@ -223,6 +223,19 @@ susefirewall2_init() {
 
         info "Starting firewalld"
         systemctl -q restart firewalld || error "Failed to start the firewalld service"
+    elif [[ ${1} == switch ]]; then
+        ${commit} || return
+        info "Stopping and disabling SuSEfirewall2"
+        systemctl -q stop SuSEfirewall2 || error "Failed to stop the SuSEfirewall2 service"
+        systemctl -q disable SuSEfirewall2 || error "Failed to disable the SuSEfirewall2 service"
+
+        info "Stopping and disabling SuSEfirewall2_init"
+        systemctl -q stop SuSEfirewall2_init || error "Failed to stop the SuSEfirewall2_init service"
+        systemctl -q disable SuSEfirewall2_init || error "Failed to disable the SuSEfirewall2_init service"
+
+        info "Starting firewalld"
+        systemctl -q start firewalld || error "Failed to start the firewalld service"
+        systemctl -q enable firewalld || error "Failed to enable the firewalld service"
     fi
 }
 
@@ -1867,5 +1880,8 @@ post_commit_report
 
 # Phew! All done right?
 trap EXIT
+
+# Make it official
+susefirewall2_init switch
 
 exit 0

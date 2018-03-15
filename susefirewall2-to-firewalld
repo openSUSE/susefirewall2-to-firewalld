@@ -1672,7 +1672,7 @@ dump_all_firewalld_commands() {
 
     IFS=$'\n'
     debug ""
-    debug "############# The following FirewallD commands has been executed ################"
+    debug "############# The following FirewallD commands have been executed ################"
     for cmd in ${all_firewalld_commands[@]}; do
         debug "firewall-cmd" ${cmd}
     done

@@ -1546,10 +1546,15 @@ do_service_to_zone_mapping() {
         rich_rule="rule family=${IP_VERSION} "
         [[ -n ${src_net} ]] && rich_rule+="source address=${src_net} "
         [[ -n ${dst_net} ]] && rich_rule+="destination address=${dst_net} "
-        if [[ -z ${ports} ]]; then
-            rich_rule+="protocol value=${proto} accept"
+        if [[ -z ${ports} && -z ${proto} ]]; then
+            # source whitelisting
+            rich_rule+="accept"
         else
-            rich_rule+="port port=${ports} protocol=${proto} accept"
+            if [[ -z ${ports} && -n ${proto} ]]; then
+                rich_rule+="protocol value=${proto} accept"
+            elif [[ -n ${ports} && -n ${proto} ]]; then
+                rich_rule+="port port=${ports} protocol=${proto} accept"
+            fi
         fi
         all_rich_rules[${zone}]+="${rich_rule}"$'\n'
         rinfo "${rich_rule}" "${zone}"

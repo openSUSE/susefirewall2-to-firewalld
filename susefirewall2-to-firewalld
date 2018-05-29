@@ -348,6 +348,18 @@ firewalld_reset() {
 }
 
 #
+# Check that the incoming iptables chain can be handled
+#
+firewalld_known_chain() {
+    local chain
+
+    for chain in ${!chain_mappings[@]}; do
+        [[ ${1} == ${chain} ]] && return 0
+    done
+    return 1
+}
+
+#
 # firewalld_default_zone: Set default zone
 #
 firewalld_default_zone() {
@@ -1658,6 +1670,8 @@ do_iptables_new_rule() {
     unhandled() {
         mwarn "-A ${chain} ${vrule}"
     }
+
+    firewalld_known_chain "${chain}" || { unhandled; return 0; }
 
     case $chain in
         INPUT|FORWARD) ;& # fall through

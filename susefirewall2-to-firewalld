@@ -64,7 +64,7 @@ fi
 if git describe --always --tags --abbrev > /dev/null 2>&1; then
     VERSION="git$(git describe --always --tags --abbrev)"
 else
-    VERSION="0.0.2"
+    VERSION="0.0.3"
 fi
 
 #

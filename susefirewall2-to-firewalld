@@ -410,56 +410,15 @@ firewalld_interfaces() {
 firewalld_services() {
     local found protocol ports service zone
 
-    #
-    # firewalld directories to look for zones, services etc.
-    # FIXME: we may also want to use rpm information to retrieve these
-    # directories since spec files might change and install things into
-    # different places.
-    #
-    declare -r -a FIREWALLD_INSTALL_DIRS=("/usr/lib/firewalld" "/etc/firewalld")
-
     for zone in ${!zone_mappings[@]}; do
         for service in ${service_to_zone[$zone]}; do
             protocol=${service%%_*}
             ports=${service##*_}
-            found=false
-            for service_dir in ${FIREWALLD_INSTALL_DIRS[@]}; do
-                [[ ! -d ${service_dir} ]] && continue
-                #
-                # We assume that only one service uses the said
-                # ports. If not, then something else needs to be done
-                # here (but what?). I am fairly sure this ugly thing can be
-                # simplified a little bit but XML parsing in bash
-                # is not pretty anyway.
-                #
-                service=$(grep -E "<port.* protocol=\"?${protocol}\"?" \
-                    ${service_dir}/services/* 2>/dev/null | \
-                    grep -E "<port.* port=\"?${ports}\"?[^0-9]" | \
-                    cut -d ":" -f 1 | rev | cut -d "/" -f 1 | rev | \
-                    sed "s/\.xml//" | head -n 1)
-                [[ -n ${service} ]] && found=true && break
-            done
-            if [[ ${found} == true ]]; then
-                if firewall-cmd -q --zone=${zone_mappings[$zone]} --query-service=${service}; then
-                    continue
-                fi
-                info "Enabling service=\"${service}\" to zone=\"${zone_mappings[${zone}]}\""
-                do_fwd_cmd --zone=${zone_mappings[${zone}]} --add-service=${service}
+            if firewall-cmd -q --zone=${zone_mappings[${zone}]} --query-port="${ports}/${protocol}"; then
+                continue
             fi
-
-            if [[ ${found} == false ]]; then
-                if firewall-cmd -q --zone=${zone_mappings[${zone}]} --query-port="${ports}/${protocol}"; then
-                    continue
-                fi
-                warn ""
-                warn "There is no firewalld service with protocol=$protocol and ports=${ports}"
-                warn "Consider creating one yourself and place it in /etc/firewalld/services/"
-                warn "or file a bug upstream if this is a well-known service."
-                warn ""
-
-                info "Adding port(s)=\"${ports}/${protocol}\" to zone=\"${zone_mappings[${zone}]}\""
-                do_fwd_cmd --zone=${zone_mappings[${zone}]} --add-port="${ports}/${protocol}"
-            fi
+            info "Adding port(s)=\"${ports}/${protocol}\" to zone=\"${zone_mappings[${zone}]}\""
+            do_fwd_cmd --zone=${zone_mappings[${zone}]} --add-port="${ports}/${protocol}"
         done
         for service in ${known_service_to_zone[$zone]}; do
             info "Enabling service=\"${service}\" to zone=\"${zone_mappings[${zone}]}\""

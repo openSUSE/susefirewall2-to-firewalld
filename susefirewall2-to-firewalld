@@ -353,7 +353,7 @@ firewalld_reset() {
 firewalld_known_chain() {
     local chain
 
-    for chain in ${!chain_mappings[@]}; do
+    for chain in ${!chain_mappings[@]} INPUT FORWARD; do
         [[ ${1} == ${chain} ]] && return 0
     done
     return 1

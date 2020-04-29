@@ -1574,8 +1574,10 @@ do_service_to_zone_mapping() {
                 all_direct_rules+=("${rule}"$'\n')
                 dinfo ${rule}
             elif [[ ${zone} == "ext" || ${zone} == "int" || ${zone} == "dmz" ]]; then
-                add_service_to_zone ${zone} ${proto} ${ports/:/-}
-                [[ $? == 0 ]] && pinfo ${ports} ${proto} ${zone}
+                if [[ -n "${ports}" ]]; then
+                        add_service_to_zone ${zone} ${proto} ${ports/:/-}
+                        [[ $? == 0 ]] && pinfo ${ports} ${proto} ${zone}
+                fi
             fi
             ;;
         icmp|ipv6-icmp)
